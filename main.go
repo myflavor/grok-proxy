@@ -29,7 +29,7 @@ const (
 	defaultClientID  = "b1a00492-073a-47ea-816f-4c329264a828"
 	defaultScope     = "openid profile email offline_access grok-cli:access api:access"
 	defaultBaseURL   = "https://cli-chat-proxy.grok.com/v1"
-	defaultCoolSec   = 120
+	defaultCoolSec   = 65
 )
 
 // ---------- 配置 ----------
