@@ -1,13 +1,13 @@
 services:
   grok-proxy:
-    image: ghcr.io/myflavor/grok-proxy:v0.3.0
+    image: ghcr.io/myflavor/grok-proxy:v0.3.1
     container_name: grok-proxy
     restart: unless-stopped
     ports:
       - "5001:5001"
     volumes:
-      # CPA JSON（活号 + 可选 *.json.dead）
+      # CPA JSON（只加载 *.json；*.json.dead 为坟场，不加载）
       - ./cpa:/data/cpa
-      # SSO accounts.txt（email:password:sso）用于 RT 死后复活
+      # SSO accounts.txt（email:password:sso）— RT 死后先 SSO 复活
       - ./sso:/data/sso
       - ./config.json:/app/config.json:ro
