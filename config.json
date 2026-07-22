@@ -2,5 +2,10 @@
   "listen": "0.0.0.0:5001",
   "api_key": "sk-your-fixed-key",
   "cpa_dir": "/data/cpa/*.json",
-  "refresh_interval": 300
+  "sso_file": "/data/sso/accounts.txt",
+  "refresh_interval": 300,
+  "revive_enabled": true,
+  "revive_interval": 600,
+  "revive_concurrency": 2,
+  "proxy": ""
 }

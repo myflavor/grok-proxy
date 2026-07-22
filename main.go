@@ -39,10 +39,15 @@ const (
 // ---------- config ----------
 
 type Config struct {
-	Listen          string `json:"listen"`
-	APIKey          string `json:"api_key"`
-	CPADir          string `json:"cpa_dir"`          // glob, e.g. /data/cpa/*.json
-	RefreshInterval int    `json:"refresh_interval"` // seconds, default 300
+	Listen            string `json:"listen"`
+	APIKey            string `json:"api_key"`
+	CPADir            string `json:"cpa_dir"`            // glob, e.g. /data/cpa/*.json
+	SSOFile           string `json:"sso_file"`           // accounts.txt or dir
+	RefreshInterval   int    `json:"refresh_interval"`   // seconds, default 300
+	ReviveEnabled     *bool  `json:"revive_enabled"`     // default true if sso_file set
+	ReviveInterval    int    `json:"revive_interval"`    // seconds, default 600
+	ReviveConcurrency int    `json:"revive_concurrency"` // default 2
+	Proxy             string `json:"proxy"`              // optional HTTP proxy for OAuth/refresh
 }
 
 // ---------- account ----------
@@ -120,15 +125,28 @@ func (a *Account) markDead(reason string) {
 
 	if path == "" {
 		log.Printf("[dead] %s: %s (no file)", email, reason)
-		return
+	} else if !strings.HasSuffix(path, ".dead") {
+		newPath := path + ".dead"
+		if err := os.Rename(path, newPath); err != nil {
+			log.Printf("[dead] %s rename failed: %v", email, err)
+		} else {
+			a.mu.Lock()
+			a.filePath = newPath
+			a.mu.Unlock()
+			log.Printf("[dead] %s → %s (%s)", email, filepath.Base(newPath), reason)
+		}
+	} else {
+		log.Printf("[dead] %s already .dead (%s)", email, reason)
 	}
-	newPath := path + ".dead"
-	if err := os.Rename(path, newPath); err != nil {
-		log.Printf("[dead] %s rename failed: %v", email, err)
-		return
+
+	// queue SSO revive if available
+	if globalReviver != nil {
+		globalReviver.Enqueue(email)
 	}
-	log.Printf("[dead] %s → %s (%s)", email, filepath.Base(newPath), reason)
 }
+
+// set by NewServer when revive enabled
+var globalReviver *Reviver
 
 // persist writes current tokens back to the CPA file (atomic rename).
 func (a *Account) persist() error {
@@ -189,14 +207,30 @@ func (p *Pool) load() error {
 	if err != nil {
 		return fmt.Errorf("glob %s: %w", p.glob, err)
 	}
+	// also pick up *.json.dead so we can revive them
+	deadGlob := p.glob + ".dead"
+	if deadMatches, err := filepath.Glob(deadGlob); err == nil {
+		matches = append(matches, deadMatches...)
+	}
+	// common pattern: /data/cpa/*.json → also /data/cpa/*.json.dead already covered
+	// if glob is /data/cpa/*.json, dead files are /data/cpa/x.json.dead — glob "*.json.dead"
+	if strings.HasSuffix(p.glob, "*.json") {
+		if dm, err := filepath.Glob(strings.TrimSuffix(p.glob, "*.json") + "*.json.dead"); err == nil {
+			matches = append(matches, dm...)
+		}
+	}
 
 	var list []*Account
 	seen := map[string]bool{}
 
 	for _, path := range matches {
-		// only bare .json — skip .json.dead / .json.tmp
 		base := filepath.Base(path)
-		if !strings.HasSuffix(strings.ToLower(base), ".json") {
+		low := strings.ToLower(base)
+		isDeadFile := strings.HasSuffix(low, ".json.dead")
+		if !strings.HasSuffix(low, ".json") && !isDeadFile {
+			continue
+		}
+		if strings.HasSuffix(low, ".tmp") {
 			continue
 		}
 
@@ -210,7 +244,7 @@ func (p *Pool) load() error {
 			log.Printf("[load] skip %s: %v", path, err)
 			continue
 		}
-		if acct.AccessToken == "" || acct.RefreshToken == "" {
+		if acct.RefreshToken == "" && acct.AccessToken == "" {
 			log.Printf("[load] skip %s: missing tokens", path)
 			continue
 		}
@@ -219,11 +253,13 @@ func (p *Pool) load() error {
 			key = path
 		}
 		if seen[key] {
+			// prefer live .json over .dead
 			continue
 		}
 		seen[key] = true
 
 		acct.filePath = path
+		acct.dead = isDeadFile
 		if acct.Expired != "" {
 			if t, err := time.Parse(time.RFC3339, acct.Expired); err == nil {
 				acct.expiresAt = t
@@ -233,12 +269,16 @@ func (p *Pool) load() error {
 		} else {
 			acct.expiresAt = time.Now()
 		}
-		if acct.Headers == nil {
-			acct.Headers = map[string]string{}
+		if acct.Headers == nil || len(acct.Headers) == 0 {
+			acct.Headers = defaultCPAHeaders()
 		}
 
 		list = append(list, &acct)
-		log.Printf("[load] %s (expires %s)", acct.Email, acct.expiresAt.Format(time.RFC3339))
+		tag := ""
+		if acct.dead {
+			tag = " DEAD"
+		}
+		log.Printf("[load] %s (expires %s)%s", acct.Email, acct.expiresAt.Format(time.RFC3339), tag)
 	}
 
 	if len(list) == 0 {
@@ -248,8 +288,40 @@ func (p *Pool) load() error {
 	p.mu.Lock()
 	p.accounts = list
 	p.mu.Unlock()
-	log.Printf("[pool] loaded %d accounts", len(list))
+	log.Printf("[pool] loaded %d accounts (live=%d)", len(list), countLive(list))
 	return nil
+}
+
+func countLive(list []*Account) int {
+	n := 0
+	for _, a := range list {
+		if !a.dead {
+			n++
+		}
+	}
+	return n
+}
+
+func (p *Pool) findByEmail(email string) *Account {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, a := range p.accounts {
+		if a.Email == email {
+			return a
+		}
+	}
+	return nil
+}
+
+func (p *Pool) add(a *Account) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, existing := range p.accounts {
+		if existing.Email == a.Email {
+			return
+		}
+	}
+	p.accounts = append(p.accounts, a)
 }
 
 func (p *Pool) liveCount() int {
@@ -563,14 +635,25 @@ func jsonResponse(code int, v any) *http.Response {
 // ---------- server ----------
 
 type Server struct {
-	cfg    Config
-	pool   *Pool
-	proxy  *httputil.ReverseProxy
-	client *http.Client
+	cfg     Config
+	pool    *Pool
+	proxy   *httputil.ReverseProxy
+	client  *http.Client
+	reviver *Reviver
+	sso     *SSOStore
 }
 
 func NewServer(cfg Config) (*Server, error) {
-	client := &http.Client{Timeout: 60 * time.Second}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if cfg.Proxy != "" {
+		u, err := url.Parse(cfg.Proxy)
+		if err != nil {
+			return nil, fmt.Errorf("proxy: %w", err)
+		}
+		transport.Proxy = http.ProxyURL(u)
+		log.Printf("[proxy] outbound via %s", cfg.Proxy)
+	}
+	client := &http.Client{Timeout: 60 * time.Second, Transport: transport}
 	pool, err := NewPool(cfg.CPADir, client)
 	if err != nil {
 		return nil, err
@@ -583,22 +666,41 @@ func NewServer(cfg Config) (*Server, error) {
 
 	s := &Server{cfg: cfg, pool: pool, client: client}
 
+	// SSO revive (optional)
+	reviveOn := cfg.SSOFile != ""
+	if cfg.ReviveEnabled != nil {
+		reviveOn = *cfg.ReviveEnabled && cfg.SSOFile != ""
+	}
+	if reviveOn {
+		sso, err := LoadSSO(cfg.SSOFile)
+		if err != nil {
+			return nil, fmt.Errorf("sso: %w", err)
+		}
+		oa, err := NewSSOOAuth(cfg.Proxy)
+		if err != nil {
+			return nil, fmt.Errorf("sso oauth: %w", err)
+		}
+		workers := cfg.ReviveConcurrency
+		if workers <= 0 {
+			workers = 2
+		}
+		s.sso = sso
+		s.reviver = NewReviver(pool, sso, oa, cpaDirFromGlob(cfg.CPADir), workers)
+		globalReviver = s.reviver
+		log.Printf("[revive] enabled sso=%d workers=%d", sso.Len(), workers)
+	}
+
 	s.proxy = &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
 			req.Host = target.Host
-			// path stays as client sent (/v1/...)
 		},
-		Transport:     &retryTransport{pool: pool, transport: http.DefaultTransport},
-		FlushInterval: -1, // stream SSE/chunked immediately
+		Transport:     &retryTransport{pool: pool, transport: transport},
+		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("[proxy] %v", err)
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
-		},
-		ModifyResponse: func(resp *http.Response) error {
-			// optional: strip upstream noise later
-			return nil
 		},
 	}
 	return s, nil
@@ -606,11 +708,18 @@ func NewServer(cfg Config) (*Server, error) {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz" || r.URL.Path == "/health" {
-		writeJSON(w, 200, map[string]any{
-			"ok":       true,
-			"live":     s.pool.liveCount(),
-			"total":    s.pool.totalCount(),
-		})
+		h := map[string]any{
+			"ok":    true,
+			"live":  s.pool.liveCount(),
+			"total": s.pool.totalCount(),
+		}
+		if s.sso != nil {
+			h["sso"] = s.sso.Len()
+		}
+		if s.reviver != nil {
+			h["revive_queue"] = s.reviver.queueSize()
+		}
+		writeJSON(w, 200, h)
 		return
 	}
 
@@ -643,7 +752,7 @@ func (s *Server) refreshLoop(ctx context.Context) {
 	if interval <= 0 {
 		interval = 300
 	}
-	// kick off immediately
+	// kick off immediately — RT first
 	s.pool.refreshAll(ctx)
 
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
@@ -656,6 +765,17 @@ func (s *Server) refreshLoop(ctx context.Context) {
 			s.pool.refreshAll(ctx)
 		}
 	}
+}
+
+func (s *Server) reviveLoop(ctx context.Context) {
+	if s.reviver == nil {
+		return
+	}
+	sec := s.cfg.ReviveInterval
+	if sec <= 0 {
+		sec = 600
+	}
+	s.reviver.Loop(ctx, time.Duration(sec)*time.Second)
 }
 
 // ---------- main ----------
@@ -692,6 +812,7 @@ func main() {
 	defer stop()
 
 	go srv.refreshLoop(ctx)
+	go srv.reviveLoop(ctx)
 
 	httpSrv := &http.Server{
 		Addr:              cfg.Listen,
@@ -712,6 +833,18 @@ func main() {
 		log.Printf("auth: enabled")
 	} else {
 		log.Printf("auth: disabled")
+	}
+	if srv.reviver != nil {
+		ri := cfg.ReviveInterval
+		if ri <= 0 {
+			ri = 600
+		}
+		rc := cfg.ReviveConcurrency
+		if rc <= 0 {
+			rc = 2
+		}
+		log.Printf("revive: sso-backed (interval=%ds concurrency=%d sso=%d)",
+			ri, rc, srv.sso.Len())
 	}
 
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

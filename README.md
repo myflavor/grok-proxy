@@ -1,8 +1,8 @@
 # grok-proxy
 
-Grok 多账号反向代理。从目录加载 CPA JSON，自动轮换、自动刷新、429 自动切号。
+Grok 多账号反向代理。CPA 轮询 + RT 自动续命 + SSO 复活死号。
 
-**对客户端始终是一个端点，一个 api_key，用完不用管。**
+**对客户端始终是一个端点，一个 api_key。**
 
 ## 配置
 
@@ -11,46 +11,62 @@ Grok 多账号反向代理。从目录加载 CPA JSON，自动轮换、自动刷
   "listen": "0.0.0.0:5001",
   "api_key": "sk-local-fixed",
   "cpa_dir": "/data/cpa/*.json",
-  "refresh_interval": 300
+  "sso_file": "/data/sso/accounts.txt",
+  "refresh_interval": 300,
+  "revive_enabled": true,
+  "revive_interval": 600,
+  "revive_concurrency": 2,
+  "proxy": ""
 }
 ```
 
 | 字段 | 说明 |
 |------|------|
 | `listen` | 监听地址，默认 `:5001` |
-| `api_key` | 客户端访问用的固定 key（空则不校验） |
-| `cpa_dir` | CPA JSON 通配路径，如 `/data/cpa/*.json` |
-| `refresh_interval` | 后台刷新间隔（秒），默认 300 |
+| `api_key` | 客户端固定 key（空则不校验） |
+| `cpa_dir` | CPA 通配路径，如 `/data/cpa/*.json`（也会加载 `*.json.dead`） |
+| `sso_file` | 注册机 `SSO/accounts.txt`（`email:pass:sso`），或目录 |
+| `refresh_interval` | RT 刷新扫描间隔（秒），默认 300 |
+| `revive_enabled` | 是否用 SSO 复活死 RT（有 `sso_file` 时默认开） |
+| `revive_interval` | 复活队列扫描间隔（秒），默认 600 |
+| `revive_concurrency` | 同时 SSO OAuth 数，默认 2（防 429） |
+| `proxy` | 可选出站 HTTP 代理（清障 `http://host:40080`） |
 
-## 运行
+## 生命周期
 
-```bash
-go build -o grok-proxy .
-./grok-proxy config.json
+```
+启动
+  → 加载 CPA（含 .dead）+ SSO
+  → refreshAll：未过期的用 RT 续命并写回 JSON
+  → 死号 / invalid_grant → 入 revive 队列
+  → 后台 SSO device OAuth（纯 HTTP，无浏览器）→ 新 CPA 写回、重新入池
 ```
 
-### Docker Compose（NAS）
+| 事件 | 处理 |
+|------|------|
+| AT 将过期 | RT refresh，写回文件 |
+| RT 吊销 | `*.json.dead` + 排队 SSO 复活 |
+| SSO 复活成功 | 去掉 .dead，写新 token，入池 |
+| SSO 失效 | 丢掉该 email 的 SSO，不再狂刷 |
+| 上游 429 | 冷却 65s 切号 |
+| 上游 402 | 冷却 1h 切号（额度，不是 token） |
+
+## Docker
 
 ```bash
-mkdir -p cpa
-# 把 xai-*.json 丢进 ./cpa/
-cp config.json.example config.json   # 改 api_key
+mkdir -p cpa sso
+# CPA
+cp /path/to/outputs/*/CPA/xai-*.json cpa/
+# SSO（合并去重）
+cat /path/to/outputs/*/SSO/accounts.txt | awk -F: '!e[$1]++' > sso/accounts.txt
+# 改 api_key
+cp config.json.example config.json   # 或编辑仓库里的 config.json
+
 docker compose up -d
+curl -s localhost:5001/healthz
 ```
 
-```yaml
-# docker-compose.yml
-services:
-  grok-proxy:
-    image: ghcr.io/myflavor/grok-proxy:latest
-    container_name: grok-proxy
-    restart: unless-stopped
-    ports:
-      - "5001:5001"
-    volumes:
-      - ./cpa:/data/cpa
-      - ./config.json:/app/config.json:ro
-```
+镜像：`ghcr.io/myflavor/grok-proxy:v0.3.0` / `latest`
 
 ## 调用
 
@@ -58,7 +74,7 @@ services:
 curl http://127.0.0.1:5001/v1/chat/completions \
   -H "Authorization: Bearer sk-local-fixed" \
   -H "Content-Type: application/json" \
-  -d '{"model":"grok-4.5","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"grok-4","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ```python
@@ -66,24 +82,11 @@ from openai import OpenAI
 client = OpenAI(api_key="sk-local-fixed", base_url="http://127.0.0.1:5001")
 ```
 
-## 行为
+健康检查：`GET /healthz` → `live` / `total` / `sso` / `revive_queue`
 
-| 事件 | 处理 |
-|------|------|
-| 正常请求 | 轮询选号，注入 CPA headers + Bearer |
-| access 将过期（5min 内） | 后台 refresh；新 token **写回 CPA 文件** |
-| 上游 429 | 该号冷却 65s，换号重试（最多 8 次） |
-| 上游 402 | 额度用尽，冷却 1h，换号重试 |
-| 上游 401/403 | 先 refresh 再重试；`invalid_grant`/revoked → 标死 |
-| refresh 失败（吊销） | 改名为 `xai-xxx.json.dead`，池内跳过 |
-| 全死 / 全凉 | 返回 503 / 429 JSON，不返回坏响应 |
+## 源码运行
 
-- 端点无前缀：`/v1/...` → `https://cli-chat-proxy.grok.com/v1/...`
-- 健康检查：`GET /healthz` → `{"ok":true,"live":N,"total":M}`
-- 信号 `SIGTERM`/`SIGINT` 优雅退出
-
-## CPA 文件
-
-兼容 [Grok-Register](https://github.com/Charles-0509/Grok-Register) 输出的 `xai-*.json`。
-
-死亡账号：`xai-xxx.json` → `xai-xxx.json.dead`（重启也不会再加载）。
+```bash
+go build -o grok-proxy .
+./grok-proxy config.json
+```
