@@ -8,7 +8,14 @@ import (
 	"time"
 )
 
-// Reviver tries to re-mint CPA via SSO when refresh_token is dead.
+// Reviver re-mints CPA via SSO when refresh_token dies.
+//
+// Policy (user-facing):
+//  1. Load only non-*.dead CPA files.
+//  2. RT fails → soft-dead + enqueue SSO (file still *.json).
+//  3. SSO ok → write new tokens, back in pool.
+//  4. SSO permanent fail / no SSO → rename *.json.dead (next boot skips forever).
+//  5. SSO rate-limit → requeue later (do NOT rename).
 type Reviver struct {
 	pool    *Pool
 	sso     *SSOStore
@@ -17,7 +24,7 @@ type Reviver struct {
 	workers int
 
 	mu     sync.Mutex
-	queue  map[string]bool // email set
+	queue  map[string]bool
 	inProg map[string]bool
 	wake   chan struct{}
 }
@@ -39,10 +46,7 @@ func NewReviver(pool *Pool, sso *SSOStore, oauth *SSOOAuth, cpaDir string, worke
 }
 
 func (r *Reviver) Enqueue(email string) {
-	if r == nil || r.sso == nil || email == "" {
-		return
-	}
-	if _, ok := r.sso.Get(email); !ok {
+	if r == nil || email == "" {
 		return
 	}
 	r.mu.Lock()
@@ -50,7 +54,6 @@ func (r *Reviver) Enqueue(email string) {
 		r.queue[email] = true
 	}
 	r.mu.Unlock()
-	// wake drain loop (non-blocking)
 	select {
 	case r.wake <- struct{}{}:
 	default:
@@ -66,7 +69,6 @@ func (r *Reviver) pending() []string {
 			continue
 		}
 		out = append(out, e)
-		// don't remove yet — mark in progress when worker takes it
 	}
 	return out
 }
@@ -74,10 +76,7 @@ func (r *Reviver) pending() []string {
 func (r *Reviver) take(email string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.inProg[email] {
-		return false
-	}
-	if !r.queue[email] {
+	if r.inProg[email] || !r.queue[email] {
 		return false
 	}
 	delete(r.queue, email)
@@ -94,32 +93,13 @@ func (r *Reviver) done(email string, requeue bool) {
 	r.mu.Unlock()
 }
 
-// SeedDead scans pool for dead accounts into queue.
-func (r *Reviver) SeedDead() {
-	if r == nil {
-		return
-	}
-	r.pool.mu.RLock()
-	list := make([]*Account, len(r.pool.accounts))
-	copy(list, r.pool.accounts)
-	r.pool.mu.RUnlock()
-	n := 0
-	for _, a := range list {
-		if a.isDead() {
-			r.Enqueue(a.Email)
-			n++
-		}
-	}
-	log.Printf("[revive] seeded %d dead account(s), queue=%d", n, r.queueSize())
-}
-
 func (r *Reviver) queueSize() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.queue) + len(r.inProg)
 }
 
-// Loop drains revive queue on wake (markDead) and periodically.
+// Loop drains on wake (soft-dead) and periodically retries rate-limited ones.
 func (r *Reviver) Loop(ctx context.Context, interval time.Duration) {
 	if r == nil || r.oauth == nil {
 		return
@@ -127,8 +107,6 @@ func (r *Reviver) Loop(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 10 * time.Minute
 	}
-	// initial seed + pass
-	r.SeedDead()
 	r.drain(ctx)
 
 	t := time.NewTicker(interval)
@@ -138,11 +116,9 @@ func (r *Reviver) Loop(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-r.wake:
-			// brief settle so batch of markDead can queue
 			time.Sleep(200 * time.Millisecond)
 			r.drain(ctx)
 		case <-t.C:
-			r.SeedDead()
 			r.drain(ctx)
 		}
 	}
@@ -167,15 +143,18 @@ func (r *Reviver) drain(ctx context.Context) {
 			requeue := false
 			if err != nil {
 				log.Printf("[revive] %s failed: %v", em, err)
-				// rate limit → requeue later
-				if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate") {
+				switch {
+				case isRateLimitErr(err):
+					// keep soft-dead, retry later — do NOT rename
 					requeue = true
-				}
-				// hard SSO failure → drop SSO entry
-				if strings.Contains(err.Error(), "sso challenge") ||
-					strings.Contains(err.Error(), "oauth_denied") ||
-					strings.Contains(err.Error(), "invalid") && strings.Contains(err.Error(), "session") {
-					r.sso.MarkBad(em)
+				default:
+					// permanent: no SSO / SSO rejected / other hard fail → .json.dead
+					if acct := r.pool.findByEmail(em); acct != nil {
+						acct.finalizeDead(err.Error())
+					}
+					if r.sso != nil && isHardSSOErr(err) {
+						r.sso.MarkBad(em)
+					}
 				}
 			} else {
 				log.Printf("[revive] %s ok", em)
@@ -187,6 +166,9 @@ func (r *Reviver) drain(ctx context.Context) {
 }
 
 func (r *Reviver) reviveOne(ctx context.Context, email string) error {
+	if r.sso == nil {
+		return errNoSSO
+	}
 	entry, ok := r.sso.Get(email)
 	if !ok {
 		return errNoSSO
@@ -199,15 +181,14 @@ func (r *Reviver) reviveOne(ctx context.Context, email string) error {
 		return err
 	}
 
-	// find existing account or create
 	acct := r.pool.findByEmail(email)
 	if acct == nil {
 		acct = &Account{
-			Email:   email,
-			Headers: defaultCPAHeaders(),
-			Type:    "xai",
-			BaseURL: upstreamURL,
-			TokenEP: tokenURL,
+			Email:    email,
+			Headers:  defaultCPAHeaders(),
+			Type:     "xai",
+			BaseURL:  upstreamURL,
+			TokenEP:  tokenURL,
 			AuthKind: "oauth",
 		}
 		r.pool.add(acct)
@@ -219,7 +200,7 @@ func (r *Reviver) reviveOne(ctx context.Context, email string) error {
 	if tok.Subject != "" {
 		acct.Sub = tok.Subject
 	}
-	if acct.Headers == nil || len(acct.Headers) == 0 {
+	if len(acct.Headers) == 0 {
 		acct.Headers = defaultCPAHeaders()
 	}
 	if acct.BaseURL == "" {
@@ -239,7 +220,6 @@ func (r *Reviver) reviveOne(ctx context.Context, email string) error {
 
 	acct.applyTokens(tok.AccessToken, tok.RefreshToken, tok.ExpiresIn)
 
-	// clear dead + restore path
 	path := ensureCPAPath(r.cpaDir, email, oldPath)
 	acct.mu.Lock()
 	acct.dead = false
@@ -247,10 +227,29 @@ func (r *Reviver) reviveOne(ctx context.Context, email string) error {
 	acct.cooldownUntil = time.Time{}
 	acct.mu.Unlock()
 
-	if err := writeAccountFile(path, acct); err != nil {
-		return err
+	return writeAccountFile(path, acct)
+}
+
+func isRateLimitErr(err error) bool {
+	if err == nil {
+		return false
 	}
-	return nil
+	s := err.Error()
+	return strings.Contains(s, "429") ||
+		strings.Contains(s, "rate") ||
+		strings.Contains(s, "rate_limited")
+}
+
+func isHardSSOErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "sso challenge") ||
+		strings.Contains(s, "oauth_denied") ||
+		strings.Contains(s, "oauth_rejected") ||
+		(strings.Contains(s, "invalid") && strings.Contains(s, "session")) ||
+		err == errNoSSO
 }
 
 var errNoSSO = errString("no sso for email")

@@ -24,30 +24,33 @@ Grok 多账号反向代理。CPA 轮询 + RT 自动续命 + SSO 复活死号。
 |------|------|
 | `listen` | 监听地址，默认 `:5001` |
 | `api_key` | 客户端固定 key（空则不校验） |
-| `cpa_dir` | CPA 通配路径，如 `/data/cpa/*.json`（也会加载 `*.json.dead`） |
+| `cpa_dir` | CPA 通配路径，如 `/data/cpa/*.json`（**不加载** `*.json.dead`） |
 | `sso_file` | 注册机 `SSO/accounts.txt`（`email:pass:sso`），或目录 |
 | `refresh_interval` | RT 刷新扫描间隔（秒），默认 300 |
 | `revive_enabled` | 是否用 SSO 复活死 RT（有 `sso_file` 时默认开） |
-| `revive_interval` | 复活队列扫描间隔（秒），默认 600 |
-| `revive_concurrency` | 同时 SSO OAuth 数，默认 2（防 429） |
+| `revive_interval` | 限流重试扫描间隔（秒），默认 600 |
+| `revive_concurrency` | 同时 SSO OAuth 数，默认 2（防 429；2000 号务必小） |
 | `proxy` | 可选出站 HTTP 代理（清障 `http://host:40080`） |
 
 ## 生命周期
 
 ```
 启动
-  → 加载 CPA（含 .dead）+ SSO
-  → refreshAll：未过期的用 RT 续命并写回 JSON
-  → 死号 / invalid_grant → 入 revive 队列
-  → 后台 SSO device OAuth（纯 HTTP，无浏览器）→ 新 CPA 写回、重新入池
+  → 只加载 *.json（跳过 *.json.dead 坟场）
+  → refreshAll：RT 续命并写回
+  → RT invalid_grant → 软死 + 排队 SSO（文件仍是 *.json）
+  → SSO 成功 → 写新 token，复活
+  → SSO 永久失败 / 无 SSO → 改名 *.json.dead（下次启动永不再碰）
+  → SSO 429 → 留在队列稍后重试（不改名）
 ```
 
 | 事件 | 处理 |
 |------|------|
 | AT 将过期 | RT refresh，写回文件 |
-| RT 吊销 | `*.json.dead` + 排队 SSO 复活 |
-| SSO 复活成功 | 去掉 .dead，写新 token，入池 |
-| SSO 失效 | 丢掉该 email 的 SSO，不再狂刷 |
+| RT 吊销 | 软死 → **先 SSO**；成功则活，失败才 `.dead` |
+| SSO 复活成功 | 写新 token，入池 |
+| SSO 永久失败 | `*.json.dead`，下次启动跳过（不反复打 SSO） |
+| SSO 限流 | 重试，不改名 |
 | 上游 429 | 冷却 65s 切号 |
 | 上游 402 | 冷却 1h 切号（额度，不是 token） |
 

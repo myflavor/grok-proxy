@@ -112,37 +112,54 @@ func (a *Account) setCooldown(d time.Duration) {
 	a.mu.Unlock()
 }
 
+// markDead is called when refresh_token is unusable.
+// Flow: soft-disable in pool → try SSO revive → only rename to .json.dead if SSO permanently fails.
+// Rate-limited SSO failures stay soft-dead and retry later (file stays *.json).
 func (a *Account) markDead(reason string) {
 	a.mu.Lock()
 	if a.dead {
 		a.mu.Unlock()
 		return
 	}
+	a.dead = true // soft: out of selection pool, file not renamed yet
+	email := a.Email
+	a.mu.Unlock()
+
+	log.Printf("[dead] %s soft-dead (%s)", email, reason)
+
+	if globalReviver != nil {
+		globalReviver.Enqueue(email)
+		return
+	}
+	// no SSO reviver configured → permanent dead immediately
+	a.finalizeDead(reason)
+}
+
+// finalizeDead renames CPA to *.json.dead so next process start skips it forever.
+func (a *Account) finalizeDead(reason string) {
+	a.mu.Lock()
 	a.dead = true
 	path := a.filePath
 	email := a.Email
 	a.mu.Unlock()
 
 	if path == "" {
-		log.Printf("[dead] %s: %s (no file)", email, reason)
-	} else if !strings.HasSuffix(path, ".dead") {
-		newPath := path + ".dead"
-		if err := os.Rename(path, newPath); err != nil {
-			log.Printf("[dead] %s rename failed: %v", email, err)
-		} else {
-			a.mu.Lock()
-			a.filePath = newPath
-			a.mu.Unlock()
-			log.Printf("[dead] %s → %s (%s)", email, filepath.Base(newPath), reason)
-		}
-	} else {
+		log.Printf("[dead] %s permanent (no file): %s", email, reason)
+		return
+	}
+	if strings.HasSuffix(path, ".dead") {
 		log.Printf("[dead] %s already .dead (%s)", email, reason)
+		return
 	}
-
-	// queue SSO revive if available
-	if globalReviver != nil {
-		globalReviver.Enqueue(email)
+	newPath := path + ".dead"
+	if err := os.Rename(path, newPath); err != nil {
+		log.Printf("[dead] %s rename failed: %v", email, err)
+		return
 	}
+	a.mu.Lock()
+	a.filePath = newPath
+	a.mu.Unlock()
+	log.Printf("[dead] %s → %s (%s)", email, filepath.Base(newPath), reason)
 }
 
 // set by NewServer when revive enabled
@@ -207,30 +224,20 @@ func (p *Pool) load() error {
 	if err != nil {
 		return fmt.Errorf("glob %s: %w", p.glob, err)
 	}
-	// also pick up *.json.dead so we can revive them
-	deadGlob := p.glob + ".dead"
-	if deadMatches, err := filepath.Glob(deadGlob); err == nil {
-		matches = append(matches, deadMatches...)
-	}
-	// common pattern: /data/cpa/*.json → also /data/cpa/*.json.dead already covered
-	// if glob is /data/cpa/*.json, dead files are /data/cpa/x.json.dead — glob "*.json.dead"
-	if strings.HasSuffix(p.glob, "*.json") {
-		if dm, err := filepath.Glob(strings.TrimSuffix(p.glob, "*.json") + "*.json.dead"); err == nil {
-			matches = append(matches, dm...)
-		}
-	}
 
 	var list []*Account
 	seen := map[string]bool{}
+	skippedDead := 0
 
 	for _, path := range matches {
 		base := filepath.Base(path)
 		low := strings.ToLower(base)
-		isDeadFile := strings.HasSuffix(low, ".json.dead")
-		if !strings.HasSuffix(low, ".json") && !isDeadFile {
+		// only bare *.json — never load *.json.dead (permanent graveyard)
+		if strings.HasSuffix(low, ".dead") || strings.HasSuffix(low, ".tmp") {
+			skippedDead++
 			continue
 		}
-		if strings.HasSuffix(low, ".tmp") {
+		if !strings.HasSuffix(low, ".json") {
 			continue
 		}
 
@@ -253,13 +260,12 @@ func (p *Pool) load() error {
 			key = path
 		}
 		if seen[key] {
-			// prefer live .json over .dead
 			continue
 		}
 		seen[key] = true
 
 		acct.filePath = path
-		acct.dead = isDeadFile
+		acct.dead = false
 		if acct.Expired != "" {
 			if t, err := time.Parse(time.RFC3339, acct.Expired); err == nil {
 				acct.expiresAt = t
@@ -274,11 +280,7 @@ func (p *Pool) load() error {
 		}
 
 		list = append(list, &acct)
-		tag := ""
-		if acct.dead {
-			tag = " DEAD"
-		}
-		log.Printf("[load] %s (expires %s)%s", acct.Email, acct.expiresAt.Format(time.RFC3339), tag)
+		log.Printf("[load] %s (expires %s)", acct.Email, acct.expiresAt.Format(time.RFC3339))
 	}
 
 	if len(list) == 0 {
@@ -288,7 +290,7 @@ func (p *Pool) load() error {
 	p.mu.Lock()
 	p.accounts = list
 	p.mu.Unlock()
-	log.Printf("[pool] loaded %d accounts (live=%d)", len(list), countLive(list))
+	log.Printf("[pool] loaded %d accounts (skipped %d .dead)", len(list), skippedDead)
 	return nil
 }
 
