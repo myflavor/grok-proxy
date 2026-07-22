@@ -1,7 +1,7 @@
 // grok-proxy: multi-account Grok reverse proxy.
 //
-// Loads CPA JSON files, round-robins accounts, auto-refreshes tokens,
-// cooldowns on 429, and marks revoked accounts as *.json.dead.
+// Loads CPA JSON, sticky account selection, RT auto-refresh (persist to disk),
+// 429/402 cooldown + switch, SSO revive on dead RT, permanent *.json.dead after SSO fail.
 // Clients always see one endpoint and one api_key.
 package main
 
@@ -128,6 +128,14 @@ func (a *Account) markDead(reason string) {
 	log.Printf("[dead] %s soft-dead (%s)", email, reason)
 
 	if globalReviver != nil {
+		// If we know there's no SSO for this email, finalize immediately
+		// (avoid queue churn for thousands of no-SSO accounts).
+		if globalReviver.sso != nil {
+			if _, ok := globalReviver.sso.Get(email); !ok {
+				a.finalizeDead(reason + "; no sso")
+				return
+			}
+		}
 		globalReviver.Enqueue(email)
 		return
 	}
@@ -581,9 +589,29 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 
 		token, email, headers, dead := acct.snapshot()
-		if dead || token == "" {
+		if dead {
 			acct = t.pool.selectAccount(email)
 			continue
+		}
+		// access empty but may still have RT — try refresh once
+		if token == "" {
+			ctx, cancel := context.WithTimeout(req.Context(), 20*time.Second)
+			refErr := t.pool.refresh(ctx, acct)
+			cancel()
+			if refErr != nil {
+				if isFatalAuth(refErr) {
+					acct.markDead(refErr.Error())
+				}
+				t.pool.advanceFrom(email)
+				acct = t.pool.selectAccount(email)
+				continue
+			}
+			token, email, headers, dead = acct.snapshot()
+			if dead || token == "" {
+				t.pool.advanceFrom(email)
+				acct = t.pool.selectAccount(email)
+				continue
+			}
 		}
 
 		// rebuild request for this attempt

@@ -234,10 +234,12 @@ func isRateLimitErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	s := err.Error()
+	s := strings.ToLower(err.Error())
+	// keep tight — bare "rate" matches too many unrelated strings
 	return strings.Contains(s, "429") ||
-		strings.Contains(s, "rate") ||
-		strings.Contains(s, "rate_limited")
+		strings.Contains(s, "rate_limited") ||
+		strings.Contains(s, "rate limit") ||
+		strings.Contains(s, "too many")
 }
 
 func isHardSSOErr(err error) bool {
