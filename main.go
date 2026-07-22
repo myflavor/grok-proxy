@@ -206,9 +206,10 @@ func (a *Account) applyTokens(access, refresh string, expiresIn int) {
 type Pool struct {
 	mu       sync.RWMutex
 	accounts []*Account
-	counter  atomic.Uint64
-	glob     string
-	client   *http.Client
+	// sticky: keep using the same account until it cools down / dies
+	cursor  atomic.Uint64 // index of preferred account
+	glob    string
+	client  *http.Client
 }
 
 func NewPool(glob string, client *http.Client) (*Pool, error) {
@@ -344,8 +345,10 @@ func (p *Pool) totalCount() int {
 	return len(p.accounts)
 }
 
-// selectAccount picks a live, non-cooling account (round-robin).
-// Expired tokens are still eligible — 401 path will refresh.
+// selectAccount picks a live account.
+// Sticky mode: reuse the current cursor account until it is dead or cooling,
+// then advance to the next available one. Not per-request round-robin.
+// exclude: skip this email (used when retrying after 429/402/auth fail).
 func (p *Pool) selectAccount(exclude string) *Account {
 	p.mu.RLock()
 	n := len(p.accounts)
@@ -356,25 +359,58 @@ func (p *Pool) selectAccount(exclude string) *Account {
 		return nil
 	}
 
-	start := int(p.counter.Add(1) % uint64(n))
+	// 1) Prefer sticky cursor (if not excluded / dead / cooling)
+	cur := int(p.cursor.Load() % uint64(n))
+	if exclude == "" {
+		a := snapshot[cur]
+		if !a.isDead() && !a.inCooldown() {
+			return a
+		}
+	}
 
-	// prefer: alive + not cooling
+	// 2) Advance from cursor+1 until we find a usable account
 	for i := 0; i < n; i++ {
-		a := snapshot[(start+i)%n]
+		idx := (cur + 1 + i) % n
+		a := snapshot[idx]
 		if a.isDead() || a.Email == exclude || a.inCooldown() {
 			continue
 		}
+		p.cursor.Store(uint64(idx))
 		return a
 	}
-	// fallback: alive even if cooling (better than nothing)
+
+	// 3) Fallback: live even if cooling (except excluded)
 	for i := 0; i < n; i++ {
-		a := snapshot[(start+i)%n]
+		idx := (cur + i) % n
+		a := snapshot[idx]
 		if a.isDead() || a.Email == exclude {
 			continue
 		}
+		p.cursor.Store(uint64(idx))
 		return a
 	}
 	return nil
+}
+
+// advanceFrom marks that email as exhausted for sticky selection and
+// moves cursor to the next account (best-effort).
+func (p *Pool) advanceFrom(email string) {
+	p.mu.RLock()
+	n := len(p.accounts)
+	for i, a := range p.accounts {
+		if a.Email == email {
+			p.cursor.Store(uint64((i + 1) % max(n, 1)))
+			break
+		}
+	}
+	p.mu.RUnlock()
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (p *Pool) cooldown(email string) {
@@ -578,6 +614,7 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 			t.pool.cooldown(email)
+			t.pool.advanceFrom(email)
 			log.Printf("[retry] %s 429 → next", email)
 			acct = t.pool.selectAccount(email)
 			continue
@@ -587,6 +624,7 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			resp.Body.Close()
 			// free-tier quota: long cooldown, don't permanently kill
 			acct.setCooldown(time.Hour)
+			t.pool.advanceFrom(email)
 			log.Printf("[retry] %s 402 quota → cooldown 1h, next", email)
 			acct = t.pool.selectAccount(email)
 			continue
@@ -610,6 +648,7 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			} else {
 				acct.setCooldown(time.Duration(cooldownSec) * time.Second)
 			}
+			t.pool.advanceFrom(email)
 			acct = t.pool.selectAccount(email)
 			continue
 		}
@@ -741,7 +780,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// pre-select account into context so first attempt is sticky
+	// sticky account: reuse until 429/402/dead
 	acct := s.pool.selectAccount("")
 	if acct != nil {
 		r = r.WithContext(context.WithValue(r.Context(), accountKey{}, acct))
