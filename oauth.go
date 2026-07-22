@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -97,17 +98,18 @@ func (o *SSOOAuth) trip(d time.Duration) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.tripCount++
-	// grow: 60s, 90s, 135s... cap 5min
+	// grow: 2min, 3min, 4.5min... cap 15min (device OAuth is easily throttled)
 	if d <= 0 {
-		d = 60 * time.Second
-		for i := 1; i < o.tripCount && d < 5*time.Minute; i++ {
+		d = 2 * time.Minute
+		for i := 1; i < o.tripCount && d < 15*time.Minute; i++ {
 			d = time.Duration(float64(d) * 1.5)
 		}
-		if d > 5*time.Minute {
-			d = 5 * time.Minute
+		if d > 15*time.Minute {
+			d = 15 * time.Minute
 		}
 	}
 	o.cooldown = time.Now().Add(d)
+	log.Printf("[oauth] rate-limit gate %s (trip=%d)", d.Round(time.Second), o.tripCount)
 }
 
 func (o *SSOOAuth) clearTrip() {
@@ -124,13 +126,13 @@ func (o *SSOOAuth) Exchange(ctx context.Context, sso string) (oauthTokens, error
 	}
 	flow, err := o.startDevice(ctx)
 	if err != nil {
-		if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate") {
+		if isOAuthRateLimit(err) {
 			o.trip(0)
 		}
 		return oauthTokens{}, err
 	}
 	if err := o.confirm(ctx, sso, flow); err != nil {
-		if strings.Contains(err.Error(), "rate") || strings.Contains(err.Error(), "429") {
+		if isOAuthRateLimit(err) {
 			o.trip(0)
 		}
 		return oauthTokens{}, err
@@ -141,6 +143,17 @@ func (o *SSOOAuth) Exchange(ctx context.Context, sso string) (oauthTokens, error
 	}
 	o.clearTrip()
 	return tok, nil
+}
+
+func isOAuthRateLimit(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "429") ||
+		strings.Contains(s, "rate_limited") ||
+		strings.Contains(s, "slow_down") ||
+		strings.Contains(s, "too many")
 }
 
 func (o *SSOOAuth) startDevice(ctx context.Context) (deviceFlow, error) {
@@ -164,8 +177,18 @@ func (o *SSOOAuth) startDevice(ctx context.Context) (deviceFlow, error) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	if resp.StatusCode == 429 {
-		return deviceFlow{}, fmt.Errorf("device authorization 429")
+
+	// Real body when hammered:
+	// HTTP 429 {"error":"slow_down","error_description":"Too many device code requests..."}
+	if resp.StatusCode == 429 || strings.Contains(strings.ToLower(string(body)), "slow_down") {
+		errCode := "slow_down"
+		var doc map[string]any
+		if json.Unmarshal(body, &doc) == nil {
+			if e, ok := doc["error"].(string); ok && e != "" {
+				errCode = e
+			}
+		}
+		return deviceFlow{}, fmt.Errorf("%s: device authorization HTTP %d", errCode, resp.StatusCode)
 	}
 	if resp.StatusCode/100 != 2 {
 		return deviceFlow{}, fmt.Errorf("device authorization status=%d body=%s", resp.StatusCode, truncate(string(body), 120))

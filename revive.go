@@ -125,10 +125,22 @@ func (r *Reviver) Loop(ctx context.Context, interval time.Duration) {
 }
 
 func (r *Reviver) drain(ctx context.Context) {
+	// Serialize through oauth gate: still allow workers, but after a rate-limit
+	// hit pause the whole drain so we don't burn the queue with 429 spam.
 	sem := make(chan struct{}, r.workers)
 	var wg sync.WaitGroup
+	var stopOnce sync.Once
+	stop := false
+	var stopMu sync.Mutex
+
 	for _, email := range r.pending() {
 		if ctx.Err() != nil {
+			break
+		}
+		stopMu.Lock()
+		halted := stop
+		stopMu.Unlock()
+		if halted {
 			break
 		}
 		if !r.take(email) {
@@ -147,6 +159,13 @@ func (r *Reviver) drain(ctx context.Context) {
 				case isRateLimitErr(err):
 					// keep soft-dead, retry later — do NOT rename
 					requeue = true
+					// halt remaining drain this round; oauth.trip already set gate
+					stopOnce.Do(func() {
+						stopMu.Lock()
+						stop = true
+						stopMu.Unlock()
+						log.Printf("[revive] rate-limited — pause drain, remaining stay queued")
+					})
 				default:
 					// permanent: no SSO / SSO rejected / other hard fail → .json.dead
 					if acct := r.pool.findByEmail(em); acct != nil {
@@ -235,8 +254,11 @@ func isRateLimitErr(err error) bool {
 		return false
 	}
 	s := strings.ToLower(err.Error())
-	// keep tight — bare "rate" matches too many unrelated strings
+	// Real device OAuth throttle (verified):
+	// HTTP 429 {"error":"slow_down","error_description":"Too many device code requests..."}
+	// confirm path may return Location error=rate_limited
 	return strings.Contains(s, "429") ||
+		strings.Contains(s, "slow_down") ||
 		strings.Contains(s, "rate_limited") ||
 		strings.Contains(s, "rate limit") ||
 		strings.Contains(s, "too many")
