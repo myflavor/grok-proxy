@@ -52,7 +52,9 @@ type Account struct {
 	Headers      map[string]string `json:"headers"`
 
 	mu            sync.Mutex
-	cooldownUntil time.Time
+	dead          bool
+	filePath      string    // 对应的 CPA JSON 文件路径
+	cooldownUntil time.Time // 429 冷却截止时间
 }
 
 func (a *Account) valid() bool {
@@ -63,6 +65,25 @@ func (a *Account) inCooldown() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return time.Now().Before(a.cooldownUntil)
+}
+
+func (a *Account) isDead() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.dead
+}
+
+func (a *Account) markDead() {
+	a.mu.Lock()
+	a.dead = true
+	a.mu.Unlock()
+	// 改后缀为 .json.dead，避免下次加载
+	newPath := a.filePath + ".dead"
+	if err := os.Rename(a.filePath, newPath); err != nil {
+		log.Printf("[dead] rename %s -> %s failed: %v", a.filePath, newPath, err)
+	} else {
+		log.Printf("[dead] %s → %s.dead", a.Email, filepath.Base(a.filePath))
+	}
 }
 
 // ---------- 账号池 ----------
@@ -106,6 +127,8 @@ func (p *Pool) load() error {
 		}
 		seen[acct.Email] = true
 
+		acct.filePath = path
+
 		if acct.RawExpired != "" {
 			if t, err := time.Parse(time.RFC3339, acct.RawExpired); err == nil {
 				acct.ExpiresAt = t
@@ -142,35 +165,44 @@ func (p *Pool) selectAccount() *Account {
 
 	start := int(p.counter.Add(1) % uint64(n))
 
-	// 找第一个未冷却 + 未过期的
+	// 找第一个未死亡 + 未冷却 + 未过期的
 	for i := 0; i < n; i++ {
 		idx := (start + i) % n
 		p.mu.RLock()
 		a := p.accounts[idx]
 		p.mu.RUnlock()
 
-		if a.inCooldown() || time.Now().After(a.ExpiresAt) {
+		if a.isDead() || a.inCooldown() || time.Now().After(a.ExpiresAt) {
 			continue
 		}
 		return a
 	}
 
-	// 都冷却了，返回第一个能用的（强制）
+	// 都冷却了，返回第一个未死亡能用的（强制）
 	for i := 0; i < n; i++ {
 		idx := (start + i) % n
 		p.mu.RLock()
 		a := p.accounts[idx]
 		p.mu.RUnlock()
+		if a.isDead() {
+			continue
+		}
 		if !a.inCooldown() {
 			return a
 		}
 	}
 
-	// 全凉了
-	p.mu.RLock()
-	a := p.accounts[start%n]
-	p.mu.RUnlock()
-	return a
+	// 全凉了，返回第一个未死亡的
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		p.mu.RLock()
+		a := p.accounts[idx]
+		p.mu.RUnlock()
+		if !a.isDead() {
+			return a
+		}
+	}
+	return nil
 }
 
 func (p *Pool) cooldown(email string, sec int) {
@@ -193,6 +225,9 @@ func (p *Pool) refreshAll(client *http.Client, scope string) {
 	p.mu.RUnlock()
 
 	for _, a := range accounts {
+		if a.isDead() {
+			continue
+		}
 		a.mu.Lock()
 		need := a.ExpiresAt.Before(time.Now().Add(5 * time.Minute)) || a.ExpiresAt.Before(time.Now())
 		a.mu.Unlock()
@@ -201,6 +236,13 @@ func (p *Pool) refreshAll(client *http.Client, scope string) {
 		}
 		if err := refreshAccount(client, a, scope); err != nil {
 			log.Printf("[refresh] %s failed: %v", a.Email, err)
+			// invalid_grant / revoked → 标记死亡，改后缀 .dead
+			errStr := err.Error()
+			if strings.Contains(errStr, "invalid_grant") ||
+				strings.Contains(errStr, "revoked") ||
+				strings.Contains(errStr, "Token has been revoked") {
+				a.markDead()
+			}
 		} else {
 			log.Printf("[refresh] %s ok, expires %s", a.Email, a.ExpiresAt.Format(time.RFC3339))
 		}
