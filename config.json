@@ -1,6 +1,6 @@
 {
   "listen": "0.0.0.0:5001",
-  "api_key": "sk-local-fixed",
-  "cpa_dir": "/home/xin/.grok/outputs/*/CPA/*.json",
+  "api_key": "sk-your-fixed-key",
+  "cpa_dir": "/data/cpa/*.json",
   "refresh_interval": 300
 }

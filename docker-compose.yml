@@ -1,0 +1,12 @@
+services:
+  grok-proxy:
+    image: ghcr.io/myflavor/grok-proxy:latest
+    container_name: grok-proxy
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    volumes:
+      # CPA JSON 文件存放目录（把所有 xai-*.json 放这里）
+      - ./cpa:/data/cpa
+      # 配置文件
+      - ./config.json:/app/config.json:ro
