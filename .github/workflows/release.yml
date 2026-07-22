@@ -100,26 +100,35 @@ jobs:
     name: Create Release
     needs: [docker, binary]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     if: startsWith(github.ref, 'refs/tags/')
 
     steps:
-      - name: Download all artifacts
+      - name: Download binary artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: grok-proxy-*
           path: artifacts
+          merge-multiple: false
 
       - name: Package binaries
         run: |
           cd artifacts
-          for dir in grok-proxy-*; do
-            name=$(basename $dir)
-            cp $dir/grok-proxy grok-proxy 2>/dev/null || cp $dir/grok-proxy.exe grok-proxy 2>/dev/null || true
-            zip -j $name.zip grok-proxy 2>/dev/null || true
-            rm -f grok-proxy
+          ls -la
+          for dir in */; do
+            name=$(basename "$dir")
+            echo "Packaging $name..."
+            if [ -f "$dir/grok-proxy" ]; then
+              cp "$dir/grok-proxy" "grok-proxy"
+              zip -j "$name.zip" "grok-proxy"
+              rm -f "grok-proxy"
+            fi
           done
+          ls -la
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*.zip
           draft: false
