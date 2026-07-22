@@ -1,6 +1,6 @@
 services:
   grok-proxy:
-    image: ghcr.io/myflavor/grok-proxy:v0.3.1
+    image: ghcr.io/myflavor/grok-proxy:v0.3.2
     container_name: grok-proxy
     restart: unless-stopped
     ports:
