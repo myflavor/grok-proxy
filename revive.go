@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"strings"
 	"sync"
@@ -166,6 +167,9 @@ func (r *Reviver) drain(ctx context.Context) {
 						stopMu.Unlock()
 						log.Printf("[revive] rate-limited — pause drain, remaining stay queued")
 					})
+				case isTransientErr(err):
+					// network/timeout — soft-dead only, retry later
+					requeue = true
 				default:
 					// permanent: no SSO / SSO rejected / other hard fail → .json.dead
 					if acct := r.pool.findByEmail(em); acct != nil {
@@ -262,6 +266,28 @@ func isRateLimitErr(err error) bool {
 		strings.Contains(s, "rate_limited") ||
 		strings.Contains(s, "rate limit") ||
 		strings.Contains(s, "too many")
+}
+
+// isTransientErr: network blips / timeouts — requeue, never .dead.
+func isTransientErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "timeout") ||
+		strings.Contains(s, "deadline exceeded") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "temporary failure") ||
+		strings.Contains(s, "i/o timeout") ||
+		strings.Contains(s, "tls handshake timeout") ||
+		strings.Contains(s, "no such host") ||
+		strings.Contains(s, "network is unreachable") ||
+		strings.Contains(s, "eof") ||
+		strings.Contains(s, "broken pipe")
 }
 
 func isHardSSOErr(err error) bool {
